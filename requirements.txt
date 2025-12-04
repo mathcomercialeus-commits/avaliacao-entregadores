@@ -1,3 +1,5 @@
 flask
 werkzeug
 gunicorn
+SQLAlchemy
+psycopg2-binary
