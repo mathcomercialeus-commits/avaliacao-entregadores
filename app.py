@@ -1,77 +1,82 @@
-import sqlite3
-from flask import Flask, request, redirect, url_for, session, g
+import os
+from datetime import datetime
+from flask import Flask, request, redirect, url_for, session
 from werkzeug.security import generate_password_hash, check_password_hash
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 
 app = Flask(__name__)
-app.secret_key = "TROQUE-ESSA-CHAVE-POR-UMA-SECRETA"
-DATABASE = "avaliacao_entregadores.db"
+app.secret_key = os.getenv("SECRET_KEY", "TROQUE-ESSA-CHAVE-POR-UMA-SECRETA")
+
+# URL do PostgreSQL (Render → DATABASE_URL)
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    # Em produção, configure a variável de ambiente DATABASE_URL no Render.
+    # Em desenvolvimento local, você pode usar um PostgreSQL local.
+    raise RuntimeError("DATABASE_URL não configurada. Defina a variável de ambiente DATABASE_URL.")
+
+# Engine global do SQLAlchemy
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 # Flag global pra garantir que init_db rode só uma vez por processo
 db_initialized = False
 
 
-# ---------------- BANCO DE DADOS ----------------
+# ---------------- BANCO DE DADOS (POSTGRES) ----------------
 
 def init_db():
-    """Cria as tabelas e o admin padrão, se ainda não existir."""
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
+    """Cria as tabelas e o admin padrão, se ainda não existir (agora em PostgreSQL)."""
+    with engine.begin() as conn:
+        # Tabela de usuários (admin e motoristas)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                role TEXT NOT NULL,       -- 'admin' ou 'driver'
+                password_hash TEXT NOT NULL
+            );
+        """))
 
-    # Tabela de usuários (admin e motoristas)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            name TEXT NOT NULL,
-            role TEXT NOT NULL,       -- 'admin' ou 'driver'
-            password_hash TEXT NOT NULL
-        );
-    """)
+        # Tabela de avaliações (já com IP e comentário)
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS ratings (
+                id SERIAL PRIMARY KEY,
+                driver_id INTEGER NOT NULL,
+                score INTEGER NOT NULL,
+                ip TEXT,
+                comment TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (driver_id) REFERENCES users(id)
+            );
+        """))
 
-    # Tabela de avaliações (já com IP e comentário)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS ratings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            driver_id INTEGER NOT NULL,
-            score INTEGER NOT NULL,
-            ip TEXT,
-            comment TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (driver_id) REFERENCES users(id)
-        );
-    """)
+        # Garantir coluna comment em bancos antigos / futuras migrações
+        try:
+            conn.execute(text("ALTER TABLE ratings ADD COLUMN comment TEXT;"))
+        except Exception:
+            # Se a coluna já existir, ignora o erro
+            pass
 
-    # Garantir que exista coluna comment em bancos antigos
-    try:
-        conn.execute("ALTER TABLE ratings ADD COLUMN comment TEXT;")
-    except sqlite3.OperationalError:
-        pass
-
-    # Cria admin padrão FARMALIMA se não existir
-    cur = conn.execute("SELECT id FROM users WHERE username = ?", ("FARMALIMA",))
-    if cur.fetchone() is None:
-        password_hash = generate_password_hash("Farma@lima3535")
-        conn.execute(
-            "INSERT INTO users (username, name, role, password_hash) VALUES (?, ?, ?, ?)",
-            ("FARMALIMA", "Administrador", "admin", password_hash),
+        # Cria admin padrão FARMALIMA se não existir
+        cur = conn.execute(
+            text("SELECT id FROM users WHERE username = :user AND role = 'admin'"),
+            {"user": "FARMALIMA"},
         )
-
-    conn.commit()
-    conn.close()
-
-
-def get_db():
-    if "db" not in g:
-        g.db = sqlite3.connect(DATABASE)
-        g.db.row_factory = sqlite3.Row
-    return g.db
-
-
-@app.teardown_appcontext
-def close_db(error):
-    db = g.pop("db", None)
-    if db is not None:
-        db.close()
+        if cur.fetchone() is None:
+            password_hash = generate_password_hash("Farma@lima3535")
+            conn.execute(
+                text(
+                    "INSERT INTO users (username, name, role, password_hash) "
+                    "VALUES (:username, :name, 'admin', :password_hash)"
+                ),
+                {
+                    "username": "FARMALIMA",
+                    "name": "Administrador",
+                    "password_hash": password_hash,
+                },
+            )
 
 
 # ---------------- LAYOUT (MOBILE + TURQUESA + CARTÃO) ----------------
@@ -634,9 +639,9 @@ def get_client_ip():
 
 def current_user():
     if "user_id" in session:
-        db = get_db()
-        cur = db.execute("SELECT * FROM users WHERE id = ?", (session["user_id"],))
-        return cur.fetchone()
+        with engine.connect() as conn:
+            cur = conn.execute(text("SELECT * FROM users WHERE id = :id"), {"id": session["user_id"]})
+            return cur.fetchone()
     return None
 
 
@@ -711,9 +716,12 @@ def admin_login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        db = get_db()
-        cur = db.execute("SELECT * FROM users WHERE username = ? AND role = 'admin'", (username,))
-        user = cur.fetchone()
+        with engine.connect() as conn:
+            cur = conn.execute(
+                text("SELECT * FROM users WHERE username = :u AND role = 'admin'"),
+                {"u": username},
+            )
+            user = cur.fetchone()
         if user and check_password_hash(user["password_hash"], password):
             session["user_id"] = user["id"]
             return redirect(url_for("admin_dashboard"))
@@ -743,39 +751,40 @@ def admin_login():
 @app.route("/admin/dashboard")
 @login_required(role="admin")
 def admin_dashboard():
-    db = get_db()
-    # Query com média, total e contagem por estrela
-    cur = db.execute("""
-        SELECT
-            u.id,
-            u.name,
-            COUNT(r.id) AS total_avaliacoes,
-            COALESCE(ROUND(AVG(r.score), 2), 0) AS media,
-            SUM(CASE WHEN r.score = 5 THEN 1 ELSE 0 END) AS s5,
-            SUM(CASE WHEN r.score = 4 THEN 1 ELSE 0 END) AS s4,
-            SUM(CASE WHEN r.score = 3 THEN 1 ELSE 0 END) AS s3,
-            SUM(CASE WHEN r.score = 2 THEN 1 ELSE 0 END) AS s2,
-            SUM(CASE WHEN r.score = 1 THEN 1 ELSE 0 END) AS s1
-        FROM users u
-        LEFT JOIN ratings r ON u.id = r.driver_id
-        WHERE u.role = 'driver'
-        GROUP BY u.id, u.name
-        ORDER BY u.name;
-    """)
-    drivers = cur.fetchall()
+    with engine.connect() as conn:
+        # Query com média, total e contagem por estrela
+        cur = conn.execute(text("""
+            SELECT
+                u.id,
+                u.name,
+                COUNT(r.id) AS total_avaliacoes,
+                COALESCE(ROUND(AVG(r.score)::numeric, 2), 0) AS media,
+                SUM(CASE WHEN r.score = 5 THEN 1 ELSE 0 END) AS s5,
+                SUM(CASE WHEN r.score = 4 THEN 1 ELSE 0 END) AS s4,
+                SUM(CASE WHEN r.score = 3 THEN 1 ELSE 0 END) AS s3,
+                SUM(CASE WHEN r.score = 2 THEN 1 ELSE 0 END) AS s2,
+                SUM(CASE WHEN r.score = 1 THEN 1 ELSE 0 END) AS s1
+            FROM users u
+            LEFT JOIN ratings r ON u.id = r.driver_id
+            WHERE u.role = 'driver'
+            GROUP BY u.id, u.name
+            ORDER BY u.name;
+        """))
+        drivers = cur.fetchall()
 
-    # Últimos comentários
-    cur_comments = db.execute("""
-        SELECT r.id, r.score, r.comment, r.created_at, u.name AS driver_name
-        FROM ratings r
-        JOIN users u ON u.id = r.driver_id
-        WHERE TRIM(COALESCE(r.comment, '')) != ''
-        ORDER BY r.created_at DESC
-        LIMIT 30;
-    """)
-    comments = cur_comments.fetchall()
+        # Últimos comentários
+        cur_comments = conn.execute(text("""
+            SELECT r.id, r.score, r.comment, r.created_at, u.name AS driver_name
+            FROM ratings r
+            JOIN users u ON u.id = r.driver_id
+            WHERE TRIM(COALESCE(r.comment, '')) != ''
+            ORDER BY r.created_at DESC
+            LIMIT 30;
+        """))
+        comments = cur_comments.fetchall()
 
     base_url = request.url_root.rstrip("/")
+
     linhas = ""
     for d in drivers:
         total = d["total_avaliacoes"] or 0
@@ -961,15 +970,17 @@ def create_driver():
     if not name or not username or not password:
         return "Dados inválidos", 400
 
-    db = get_db()
     try:
         password_hash = generate_password_hash(password)
-        db.execute(
-            "INSERT INTO users (username, name, role, password_hash) VALUES (?, ?, 'driver', ?)",
-            (username, name, password_hash),
-        )
-        db.commit()
-    except sqlite3.IntegrityError:
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO users (username, name, role, password_hash) "
+                    "VALUES (:username, :name, 'driver', :password_hash)"
+                ),
+                {"username": username, "name": name, "password_hash": password_hash},
+            )
+    except IntegrityError:
         return "Usuário já existe", 400
 
     return redirect(url_for("admin_dashboard"))
@@ -978,28 +989,25 @@ def create_driver():
 @app.route("/admin/reset_ratings/<int:driver_id>", methods=["POST"])
 @login_required(role="admin")
 def reset_ratings(driver_id):
-    db = get_db()
-    db.execute("DELETE FROM ratings WHERE driver_id = ?", (driver_id,))
-    db.commit()
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM ratings WHERE driver_id = :id"), {"id": driver_id})
     return redirect(url_for("admin_dashboard"))
 
 
 @app.route("/admin/reset_all_ratings", methods=["POST"])
 @login_required(role="admin")
 def reset_all_ratings():
-    db = get_db()
-    db.execute("DELETE FROM ratings")
-    db.commit()
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM ratings"))
     return redirect(url_for("admin_dashboard"))
 
 
 @app.route("/admin/delete_driver/<int:driver_id>", methods=["POST"])
 @login_required(role="admin")
 def delete_driver(driver_id):
-    db = get_db()
-    db.execute("DELETE FROM ratings WHERE driver_id = ?", (driver_id,))
-    db.execute("DELETE FROM users WHERE id = ?", (driver_id,))
-    db.commit()
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM ratings WHERE driver_id = :id"), {"id": driver_id})
+        conn.execute(text("DELETE FROM users WHERE id = :id"), {"id": driver_id})
     return redirect(url_for("admin_dashboard"))
 
 
@@ -1011,9 +1019,12 @@ def driver_login():
     if request.method == "POST":
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
-        db = get_db()
-        cur = db.execute("SELECT * FROM users WHERE username = ? AND role = 'driver'", (username,))
-        user = cur.fetchone()
+        with engine.connect() as conn:
+            cur = conn.execute(
+                text("SELECT * FROM users WHERE username = :u AND role = 'driver'"),
+                {"u": username},
+            )
+            user = cur.fetchone()
         if user and check_password_hash(user["password_hash"], password):
             session["user_id"] = user["id"]
             return redirect(url_for("driver_panel"))
@@ -1046,7 +1057,7 @@ def driver_login():
 @login_required(role="driver")
 def driver_panel():
     user = current_user()
-    rate_url = request.url_root.rstrip('/') + url_for("rate_driver", driver_id=user["id"])
+    rate_url = request.url_root.rstrip("/") + url_for("rate_driver", driver_id=user["id"])
     qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=260x260&data={rate_url}"
 
     body = f"""
@@ -1077,9 +1088,13 @@ def driver_panel():
 
 @app.route("/avaliar/<int:driver_id>", methods=["GET", "POST"])
 def rate_driver(driver_id):
-    db = get_db()
-    cur = db.execute("SELECT * FROM users WHERE id = ? AND role = 'driver'", (driver_id,))
-    driver = cur.fetchone()
+    with engine.connect() as conn:
+        cur = conn.execute(
+            text("SELECT * FROM users WHERE id = :id AND role = 'driver'"),
+            {"id": driver_id},
+        )
+        driver = cur.fetchone()
+
     if not driver:
         return "Motorista não encontrado", 404
 
@@ -1088,13 +1103,18 @@ def rate_driver(driver_id):
 
     if request.method == "POST":
         # Verifica se este IP já avaliou ALGUM motorista nos últimos 7 dias
-        cur = db.execute(
-            "SELECT COUNT(*) AS total FROM ratings "
-            "WHERE ip = ? AND created_at >= datetime('now','-7 days')",
-            (ip,),
-        )
-        row = cur.fetchone()
-        if row["total"] > 0:
+        with engine.connect() as conn:
+            cur = conn.execute(
+                text(
+                    "SELECT COUNT(*) AS total FROM ratings "
+                    "WHERE ip = :ip AND created_at >= NOW() - INTERVAL '7 days'"
+                ),
+                {"ip": ip},
+            )
+            row = cur.fetchone()
+
+        total = row["total"] if row else 0
+        if total > 0:
             msg = "Você já fez uma avaliação recentemente. Só é permitido 1 avaliação por semana neste dispositivo."
         else:
             try:
@@ -1107,11 +1127,19 @@ def rate_driver(driver_id):
             if score < 1 or score > 5:
                 msg = "Selecione uma nota entre 1 e 5 estrelas."
             else:
-                db.execute(
-                    "INSERT INTO ratings (driver_id, score, ip, comment) VALUES (?, ?, ?, ?)",
-                    (driver_id, score, ip, comment),
-                )
-                db.commit()
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            "INSERT INTO ratings (driver_id, score, ip, comment) "
+                            "VALUES (:driver_id, :score, :ip, :comment)"
+                        ),
+                        {
+                            "driver_id": driver_id,
+                            "score": score,
+                            "ip": ip,
+                            "comment": comment,
+                        },
+                    )
                 body = f"""
                 <h1>Obrigado pela sua avaliação 💙</h1>
                 <p class="subtitle-center">
