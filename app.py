@@ -1,5 +1,4 @@
 import os
-from datetime import datetime
 from flask import Flask, request, redirect, url_for, session
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy import create_engine, text
@@ -12,8 +11,6 @@ app.secret_key = os.getenv("SECRET_KEY", "TROQUE-ESSA-CHAVE-POR-UMA-SECRETA")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
-    # Em produção, configure a variável de ambiente DATABASE_URL no Render.
-    # Em desenvolvimento local, você pode usar um PostgreSQL local.
     raise RuntimeError("DATABASE_URL não configurada. Defina a variável de ambiente DATABASE_URL.")
 
 # Engine global do SQLAlchemy
@@ -26,7 +23,7 @@ db_initialized = False
 # ---------------- BANCO DE DADOS (POSTGRES) ----------------
 
 def init_db():
-    """Cria as tabelas e o admin padrão, se ainda não existir (agora em PostgreSQL)."""
+    """Cria as tabelas e o admin padrão, se ainda não existir (PostgreSQL)."""
     with engine.begin() as conn:
         # Tabela de usuários (admin e motoristas)
         conn.execute(text("""
@@ -39,7 +36,7 @@ def init_db():
             );
         """))
 
-        # Tabela de avaliações (já com IP e comentário)
+        # Tabela de avaliações
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS ratings (
                 id SERIAL PRIMARY KEY,
@@ -52,12 +49,8 @@ def init_db():
             );
         """))
 
-        # Garantir coluna comment em bancos antigos / futuras migrações
-        try:
-            conn.execute(text("ALTER TABLE ratings ADD COLUMN comment TEXT;"))
-        except Exception:
-            # Se a coluna já existir, ignora o erro
-            pass
+        # Garantir que exista coluna comment (seguro em PostgreSQL)
+        conn.execute(text("ALTER TABLE ratings ADD COLUMN IF NOT EXISTS comment TEXT;"))
 
         # Cria admin padrão FARMALIMA se não existir
         cur = conn.execute(
@@ -144,7 +137,7 @@ def render_page(title: str, body_html: str) -> str:
         /* Área de conteúdo */
         .page {{
             min-height: 100vh;
-            padding: 80px 12px 24px; /* espaço pro cabeçalho */
+            padding: 80px 12px 24px;
             display: flex;
             justify-content: center;
         }}
@@ -302,15 +295,6 @@ def render_page(title: str, body_html: str) -> str:
         }}
 
         /* Mensagens */
-        .msg {{
-            padding: 10px 12px;
-            background:#e3f2fd;
-            border:1px solid #90caf9;
-            border-radius:10px;
-            margin-bottom:10px;
-            font-size:0.9rem;
-        }}
-
         .erro {{
             padding:10px 12px;
             background:#ffebee;
@@ -582,7 +566,6 @@ def render_page(title: str, body_html: str) -> str:
     </style>
 
     <script>
-        // Atualiza texto de "nota" igual apps de delivery
         function setupRatingText() {{
             var radios = document.querySelectorAll('input[name="score"]');
             var label = document.getElementById('rating-text');
@@ -752,7 +735,6 @@ def admin_login():
 @login_required(role="admin")
 def admin_dashboard():
     with engine.connect() as conn:
-        # Query com média, total e contagem por estrela
         cur = conn.execute(text("""
             SELECT
                 u.id,
@@ -772,7 +754,6 @@ def admin_dashboard():
         """))
         drivers = cur.fetchall()
 
-        # Últimos comentários
         cur_comments = conn.execute(text("""
             SELECT r.id, r.score, r.comment, r.created_at, u.name AS driver_name
             FROM ratings r
