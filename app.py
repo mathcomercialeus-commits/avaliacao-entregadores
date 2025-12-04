@@ -623,8 +623,12 @@ def get_client_ip():
 def current_user():
     if "user_id" in session:
         with engine.connect() as conn:
-            cur = conn.execute(text("SELECT * FROM users WHERE id = :id"), {"id": session["user_id"]})
-            return cur.fetchone()
+            cur = conn.execute(
+                text("SELECT id, username, name, role, password_hash FROM users WHERE id = :id"),
+                {"id": session["user_id"]},
+            )
+            user = cur.mappings().first()
+            return user
     return None
 
 
@@ -701,10 +705,10 @@ def admin_login():
         password = request.form.get("password", "")
         with engine.connect() as conn:
             cur = conn.execute(
-                text("SELECT * FROM users WHERE username = :u AND role = 'admin'"),
+                text("SELECT id, username, name, role, password_hash FROM users WHERE username = :u AND role = 'admin'"),
                 {"u": username},
             )
-            user = cur.fetchone()
+            user = cur.mappings().first()
         if user and check_password_hash(user["password_hash"], password):
             session["user_id"] = user["id"]
             return redirect(url_for("admin_dashboard"))
@@ -735,7 +739,7 @@ def admin_login():
 @login_required(role="admin")
 def admin_dashboard():
     with engine.connect() as conn:
-        cur = conn.execute(text("""
+        drivers = conn.execute(text("""
             SELECT
                 u.id,
                 u.name,
@@ -751,18 +755,16 @@ def admin_dashboard():
             WHERE u.role = 'driver'
             GROUP BY u.id, u.name
             ORDER BY u.name;
-        """))
-        drivers = cur.fetchall()
+        """)).mappings().all()
 
-        cur_comments = conn.execute(text("""
+        comments = conn.execute(text("""
             SELECT r.id, r.score, r.comment, r.created_at, u.name AS driver_name
             FROM ratings r
             JOIN users u ON u.id = r.driver_id
             WHERE TRIM(COALESCE(r.comment, '')) != ''
             ORDER BY r.created_at DESC
             LIMIT 30;
-        """))
-        comments = cur_comments.fetchall()
+        """)).mappings().all()
 
     base_url = request.url_root.rstrip("/")
 
@@ -1002,10 +1004,10 @@ def driver_login():
         password = request.form.get("password", "")
         with engine.connect() as conn:
             cur = conn.execute(
-                text("SELECT * FROM users WHERE username = :u AND role = 'driver'"),
+                text("SELECT id, username, name, role, password_hash FROM users WHERE username = :u AND role = 'driver'"),
                 {"u": username},
             )
-            user = cur.fetchone()
+            user = cur.mappings().first()
         if user and check_password_hash(user["password_hash"], password):
             session["user_id"] = user["id"]
             return redirect(url_for("driver_panel"))
@@ -1071,10 +1073,10 @@ def driver_panel():
 def rate_driver(driver_id):
     with engine.connect() as conn:
         cur = conn.execute(
-            text("SELECT * FROM users WHERE id = :id AND role = 'driver'"),
+            text("SELECT id, username, name, role FROM users WHERE id = :id AND role = 'driver'"),
             {"id": driver_id},
         )
-        driver = cur.fetchone()
+        driver = cur.mappings().first()
 
     if not driver:
         return "Motorista não encontrado", 404
@@ -1092,7 +1094,7 @@ def rate_driver(driver_id):
                 ),
                 {"ip": ip},
             )
-            row = cur.fetchone()
+            row = cur.mappings().first()
 
         total = row["total"] if row else 0
         if total > 0:
