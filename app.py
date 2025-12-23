@@ -879,7 +879,7 @@ def admin_dashboard():
     body = f"""
     <h1>Painel do Administrador 🧑‍💼</h1>
     <p class="subtitle-center">
-        Veja notas no estilo Google, acompanhe comentários e gerencie motoristas.
+        Veja notas, acompanhe comentários e gerencie motoristas.
     </p>
 
     <div class="section">
@@ -1183,3 +1183,4 @@ def logout():
 if __name__ == "__main__":
     init_db()
     app.run(debug=True)
+
