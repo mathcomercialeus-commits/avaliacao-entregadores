@@ -1,7 +1,8 @@
 import os
+import uuid
 import hashlib
 from functools import wraps
-from flask import Flask, request, redirect, url_for, session
+from flask import Flask, request, redirect, url_for, session, make_response
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
@@ -11,7 +12,6 @@ app.secret_key = os.getenv("SECRET_KEY", "TROQUE-ESSA-CHAVE-POR-UMA-SECRETA")
 
 # URL do PostgreSQL (Render → DATABASE_URL)
 DATABASE_URL = os.getenv("DATABASE_URL")
-
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL não configurada. Defina a variável de ambiente DATABASE_URL.")
 
@@ -22,9 +22,12 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 db_initialized = False
 
 # ---------------- ANTIFRAUDE (CONFIG) ----------------
-RATE_LIMIT_MINUTES = 3          # bloqueio curto por IP/FP
-WEEKLY_BLOCK_DAYS = 7           # bloqueio “1 por semana” (IP ou FP)
-DRIVER_FP_BLOCK_DAYS = 30       # bloqueio “mesmo dispositivo avaliando o mesmo motorista”
+RATE_LIMIT_MINUTES = 3           # anti-spam (IP e device) em janela curta
+WEEKLY_BLOCK_DAYS = 7            # 1 avaliação por semana por DISPOSITIVO
+DRIVER_DEVICE_BLOCK_DAYS = 30    # 1 avaliação por motorista por dispositivo em 30 dias
+
+# Se estiver em HTTPS e quiser forçar cookie Secure, setar env COOKIE_SECURE=1 no Render
+COOKIE_SECURE_ENV = os.getenv("COOKIE_SECURE", "0") == "1"
 
 
 # ---------------- BANCO DE DADOS (POSTGRES) ----------------
@@ -51,6 +54,7 @@ def init_db():
                 score INTEGER NOT NULL,
                 ip TEXT,
                 fingerprint TEXT,
+                device_id TEXT,
                 comment TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (driver_id) REFERENCES users(id)
@@ -60,11 +64,13 @@ def init_db():
         # Garantir colunas (seguro em PostgreSQL)
         conn.execute(text("ALTER TABLE ratings ADD COLUMN IF NOT EXISTS comment TEXT;"))
         conn.execute(text("ALTER TABLE ratings ADD COLUMN IF NOT EXISTS fingerprint TEXT;"))
+        conn.execute(text("ALTER TABLE ratings ADD COLUMN IF NOT EXISTS device_id TEXT;"))
 
         # Índices (performance + antifraude)
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ratings_ip_created ON ratings (ip, created_at);"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ratings_fp_created ON ratings (fingerprint, created_at);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ratings_driver_fp_created ON ratings (driver_id, fingerprint, created_at);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ratings_device_created ON ratings (device_id, created_at);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ratings_driver_device_created ON ratings (driver_id, device_id, created_at);"))
 
         # Cria admin padrão FARMALIMA se não existir
         cur = conn.execute(
@@ -636,8 +642,8 @@ def get_client_ip():
 
 def device_fingerprint():
     """
-    Fingerprint leve (não perfeito, mas MUITO forte junto com IP/rate-limit).
-    Não usa dados sensíveis, só headers comuns.
+    Fingerprint leve (ajuda junto com IP e device_id).
+    Não é o principal, porque headers podem variar em celulares.
     """
     raw = "|".join([
         request.headers.get("User-Agent", "")[:300],
@@ -648,32 +654,24 @@ def device_fingerprint():
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-def is_rate_limited(ip: str, fp: str):
-    """Rate limit curto para evitar spam e automação."""
-    with engine.connect() as conn:
-        # 1) Por IP
-        r1 = conn.execute(text("""
-            SELECT COUNT(*) AS total
-            FROM ratings
-            WHERE ip = :ip
-              AND created_at >= NOW() - INTERVAL :mins
-        """), {"ip": ip, "mins": f"{RATE_LIMIT_MINUTES} minutes"}).mappings().first()
+def ensure_device_cookie(resp):
+    """
+    Garante cookie de device_id (did). Isso é o que resolve trocar de Wi-Fi/4G/VPN.
+    """
+    did = request.cookies.get("did")
+    if not did:
+        did = str(uuid.uuid4())
 
-        if r1 and (r1["total"] or 0) > 0:
-            return True, "Muitas tentativas em pouco tempo. Aguarde alguns minutos e tente novamente."
-
-        # 2) Por fingerprint
-        r2 = conn.execute(text("""
-            SELECT COUNT(*) AS total
-            FROM ratings
-            WHERE fingerprint = :fp
-              AND created_at >= NOW() - INTERVAL :mins
-        """), {"fp": fp, "mins": f"{RATE_LIMIT_MINUTES} minutes"}).mappings().first()
-
-        if r2 and (r2["total"] or 0) > 0:
-            return True, "Muitas tentativas em pouco tempo neste dispositivo. Aguarde alguns minutos."
-
-    return False, ""
+        secure_flag = COOKIE_SECURE_ENV or request.is_secure
+        resp.set_cookie(
+            "did",
+            did,
+            max_age=60 * 60 * 24 * 180,  # 180 dias
+            httponly=True,
+            samesite="Lax",
+            secure=secure_flag,
+        )
+    return did
 
 
 def current_user():
@@ -748,7 +746,10 @@ def index():
             <button class="btn-full btn-outline" onclick="window.location.href='/driver/login'">Sou Motorista</button>
         </div>
         """
-    return render_page("Início", body)
+
+    resp = make_response(render_page("Início", body))
+    ensure_device_cookie(resp)
+    return resp
 
 
 # ----- LOGIN ADMIN -----
@@ -786,7 +787,10 @@ def admin_login():
         <button class="btn-full btn-outline" type="button" onclick="window.location.href='/'">Voltar</button>
     </div>
     """
-    return render_page("Login Admin", body)
+
+    resp = make_response(render_page("Login Admin", body))
+    ensure_device_cookie(resp)
+    return resp
 
 
 # ----- PAINEL ADMIN (GOOGLE-LIKE) -----
@@ -997,7 +1001,10 @@ def admin_dashboard():
         <button class="btn-full btn-outline" type="button" onclick="window.location.href='/'">Voltar ao início</button>
     </div>
     """
-    return render_page("Painel Admin", body)
+
+    resp = make_response(render_page("Painel Admin", body))
+    ensure_device_cookie(resp)
+    return resp
 
 
 @app.route("/admin/create_driver", methods=["POST"])
@@ -1087,7 +1094,10 @@ def driver_login():
         <button class="btn-full btn-outline" type="button" onclick="window.location.href='/'">Voltar</button>
     </div>
     """
-    return render_page("Login Motorista", body)
+
+    resp = make_response(render_page("Login Motorista", body))
+    ensure_device_cookie(resp)
+    return resp
 
 
 # ----- PAINEL MOTORISTA (QR CODE) -----
@@ -1120,7 +1130,10 @@ def driver_panel():
         <button class="btn-full btn-outline" type="button" onclick="window.location.href='/logout'">Sair</button>
     </div>
     """
-    return render_page("Painel Motorista", body)
+
+    resp = make_response(render_page("Painel Motorista", body))
+    ensure_device_cookie(resp)
+    return resp
 
 
 # ----- PÁGINA DE AVALIAÇÃO (COM COMENTÁRIO + ANTIFRAUDE) -----
@@ -1137,45 +1150,61 @@ def rate_driver(driver_id):
     if not driver:
         return "Motorista não encontrado", 404
 
-    msg = ""
     ip = get_client_ip()
     fp = device_fingerprint()
 
+    # did (device_id): se não vier cookie, gera um agora (e salva no response)
+    did = request.cookies.get("did") or str(uuid.uuid4())
+
+    msg = ""
+
     if request.method == "POST":
-        # Honeypot anti-bot (campo invisível). Bot costuma preencher.
+        # Honeypot anti-bot
         if request.form.get("website", "").strip():
             msg = "Avaliação inválida."
         else:
-            # Rate limit curto (anti-spam / automação)
-            limited, reason = is_rate_limited(ip, fp)
-            if limited:
-                msg = reason
+            # Rate limit curto: por IP e por device_id
+            with engine.connect() as conn:
+                r_ip = conn.execute(text(f"""
+                    SELECT COUNT(*) AS total
+                    FROM ratings
+                    WHERE ip = :ip
+                      AND created_at >= NOW() - INTERVAL '{RATE_LIMIT_MINUTES} minutes'
+                """), {"ip": ip}).mappings().first()
+
+                r_did = conn.execute(text(f"""
+                    SELECT COUNT(*) AS total
+                    FROM ratings
+                    WHERE device_id = :did
+                      AND created_at >= NOW() - INTERVAL '{RATE_LIMIT_MINUTES} minutes'
+                """), {"did": did}).mappings().first()
+
+            if (r_ip and (r_ip["total"] or 0) > 0) or (r_did and (r_did["total"] or 0) > 0):
+                msg = "Muitas tentativas em pouco tempo. Aguarde alguns minutos e tente novamente."
             else:
-                # Bloqueio por motorista + fingerprint (anti-inflar)
+                # Anti-inflar: por motorista + device_id
                 with engine.connect() as conn:
-                    cur = conn.execute(text("""
+                    r_driver = conn.execute(text(f"""
                         SELECT COUNT(*) AS total
                         FROM ratings
                         WHERE driver_id = :driver_id
-                          AND fingerprint = :fp
-                          AND created_at >= NOW() - INTERVAL :days
-                    """), {"driver_id": driver_id, "fp": fp, "days": f"{DRIVER_FP_BLOCK_DAYS} days"})
-                    row = cur.mappings().first()
-                if row and (row["total"] or 0) > 0:
+                          AND device_id = :did
+                          AND created_at >= NOW() - INTERVAL '{DRIVER_DEVICE_BLOCK_DAYS} days'
+                    """), {"driver_id": driver_id, "did": did}).mappings().first()
+
+                if r_driver and (r_driver["total"] or 0) > 0:
                     msg = "Você já avaliou este motorista recentemente neste dispositivo."
                 else:
-                    # Bloqueio semanal (melhorado): IP OU fingerprint
+                    # BLOQUEIO PRINCIPAL: semanal por device_id (independe de Wi-Fi)
                     with engine.connect() as conn:
-                        cur = conn.execute(text("""
+                        r_week = conn.execute(text(f"""
                             SELECT COUNT(*) AS total
                             FROM ratings
-                            WHERE (ip = :ip OR fingerprint = :fp)
-                              AND created_at >= NOW() - INTERVAL :days
-                        """), {"ip": ip, "fp": fp, "days": f"{WEEKLY_BLOCK_DAYS} days"})
-                        row = cur.mappings().first()
+                            WHERE device_id = :did
+                              AND created_at >= NOW() - INTERVAL '{WEEKLY_BLOCK_DAYS} days'
+                        """), {"did": did}).mappings().first()
 
-                    total = row["total"] if row else 0
-                    if total > 0:
+                    if r_week and (r_week["total"] or 0) > 0:
                         msg = "Você já fez uma avaliação recentemente. Só é permitido 1 avaliação por semana neste dispositivo."
                     else:
                         try:
@@ -1191,17 +1220,19 @@ def rate_driver(driver_id):
                             with engine.begin() as conn:
                                 conn.execute(
                                     text(
-                                        "INSERT INTO ratings (driver_id, score, ip, fingerprint, comment) "
-                                        "VALUES (:driver_id, :score, :ip, :fingerprint, :comment)"
+                                        "INSERT INTO ratings (driver_id, score, ip, fingerprint, device_id, comment) "
+                                        "VALUES (:driver_id, :score, :ip, :fingerprint, :device_id, :comment)"
                                     ),
                                     {
                                         "driver_id": driver_id,
                                         "score": score,
                                         "ip": ip,
                                         "fingerprint": fp,
+                                        "device_id": did,
                                         "comment": comment,
                                     },
                                 )
+
                             body = f"""
                             <h1>Obrigado pela sua avaliação 💙</h1>
                             <p class="subtitle-center">
@@ -1211,7 +1242,9 @@ def rate_driver(driver_id):
                                 Motorista avaliado: <strong>{driver['name']}</strong>
                             </p>
                             """
-                            return render_page("Obrigado", body)
+                            resp = make_response(render_page("Obrigado", body))
+                            ensure_device_cookie(resp)
+                            return resp
 
     msg_html = f'<div class="erro">{msg}</div>' if msg else ""
     body = f"""
@@ -1249,7 +1282,10 @@ def rate_driver(driver_id):
         <button type="submit" class="btn-full">Enviar avaliação</button>
     </form>
     """
-    return render_page("Avaliar Entregador", body)
+
+    resp = make_response(render_page("Avaliar Entregador", body))
+    ensure_device_cookie(resp)
+    return resp
 
 
 # ----- LOGOUT -----
