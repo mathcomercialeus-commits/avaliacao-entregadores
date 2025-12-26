@@ -1,4 +1,6 @@
 import os
+import hashlib
+from functools import wraps
 from flask import Flask, request, redirect, url_for, session
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy import create_engine, text
@@ -18,6 +20,11 @@ engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 # Flag global pra garantir que init_db rode só uma vez por processo
 db_initialized = False
+
+# ---------------- ANTIFRAUDE (CONFIG) ----------------
+RATE_LIMIT_MINUTES = 3          # bloqueio curto por IP/FP
+WEEKLY_BLOCK_DAYS = 7           # bloqueio “1 por semana” (IP ou FP)
+DRIVER_FP_BLOCK_DAYS = 30       # bloqueio “mesmo dispositivo avaliando o mesmo motorista”
 
 
 # ---------------- BANCO DE DADOS (POSTGRES) ----------------
@@ -43,14 +50,21 @@ def init_db():
                 driver_id INTEGER NOT NULL,
                 score INTEGER NOT NULL,
                 ip TEXT,
+                fingerprint TEXT,
                 comment TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (driver_id) REFERENCES users(id)
             );
         """))
 
-        # Garantir que exista coluna comment (seguro em PostgreSQL)
+        # Garantir colunas (seguro em PostgreSQL)
         conn.execute(text("ALTER TABLE ratings ADD COLUMN IF NOT EXISTS comment TEXT;"))
+        conn.execute(text("ALTER TABLE ratings ADD COLUMN IF NOT EXISTS fingerprint TEXT;"))
+
+        # Índices (performance + antifraude)
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ratings_ip_created ON ratings (ip, created_at);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ratings_fp_created ON ratings (fingerprint, created_at);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ratings_driver_fp_created ON ratings (driver_id, fingerprint, created_at);"))
 
         # Cria admin padrão FARMALIMA se não existir
         cur = conn.execute(
@@ -620,6 +634,48 @@ def get_client_ip():
     return request.remote_addr or "desconhecido"
 
 
+def device_fingerprint():
+    """
+    Fingerprint leve (não perfeito, mas MUITO forte junto com IP/rate-limit).
+    Não usa dados sensíveis, só headers comuns.
+    """
+    raw = "|".join([
+        request.headers.get("User-Agent", "")[:300],
+        request.headers.get("Accept-Language", "")[:200],
+        request.headers.get("Sec-CH-UA", "")[:300],
+        request.headers.get("Sec-CH-UA-Platform", "")[:100],
+    ])
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def is_rate_limited(ip: str, fp: str):
+    """Rate limit curto para evitar spam e automação."""
+    with engine.connect() as conn:
+        # 1) Por IP
+        r1 = conn.execute(text("""
+            SELECT COUNT(*) AS total
+            FROM ratings
+            WHERE ip = :ip
+              AND created_at >= NOW() - INTERVAL :mins
+        """), {"ip": ip, "mins": f"{RATE_LIMIT_MINUTES} minutes"}).mappings().first()
+
+        if r1 and (r1["total"] or 0) > 0:
+            return True, "Muitas tentativas em pouco tempo. Aguarde alguns minutos e tente novamente."
+
+        # 2) Por fingerprint
+        r2 = conn.execute(text("""
+            SELECT COUNT(*) AS total
+            FROM ratings
+            WHERE fingerprint = :fp
+              AND created_at >= NOW() - INTERVAL :mins
+        """), {"fp": fp, "mins": f"{RATE_LIMIT_MINUTES} minutes"}).mappings().first()
+
+        if r2 and (r2["total"] or 0) > 0:
+            return True, "Muitas tentativas em pouco tempo neste dispositivo. Aguarde alguns minutos."
+
+    return False, ""
+
+
 def current_user():
     if "user_id" in session:
         with engine.connect() as conn:
@@ -634,6 +690,7 @@ def current_user():
 
 def login_required(role=None):
     def decorator(fn):
+        @wraps(fn)
         def wrapper(*args, **kwargs):
             user = current_user()
             if not user:
@@ -641,7 +698,6 @@ def login_required(role=None):
             if role and user["role"] != role:
                 return "Acesso negado", 403
             return fn(*args, **kwargs)
-        wrapper.__name__ = fn.__name__
         return wrapper
     return decorator
 
@@ -1083,56 +1139,79 @@ def rate_driver(driver_id):
 
     msg = ""
     ip = get_client_ip()
+    fp = device_fingerprint()
 
     if request.method == "POST":
-        # Verifica se este IP já avaliou ALGUM motorista nos últimos 7 dias
-        with engine.connect() as conn:
-            cur = conn.execute(
-                text(
-                    "SELECT COUNT(*) AS total FROM ratings "
-                    "WHERE ip = :ip AND created_at >= NOW() - INTERVAL '7 days'"
-                ),
-                {"ip": ip},
-            )
-            row = cur.mappings().first()
-
-        total = row["total"] if row else 0
-        if total > 0:
-            msg = "Você já fez uma avaliação recentemente. Só é permitido 1 avaliação por semana neste dispositivo."
+        # Honeypot anti-bot (campo invisível). Bot costuma preencher.
+        if request.form.get("website", "").strip():
+            msg = "Avaliação inválida."
         else:
-            try:
-                score = int(request.form.get("score", "0"))
-            except ValueError:
-                score = 0
-
-            comment = request.form.get("comment", "").strip()
-
-            if score < 1 or score > 5:
-                msg = "Selecione uma nota entre 1 e 5 estrelas."
+            # Rate limit curto (anti-spam / automação)
+            limited, reason = is_rate_limited(ip, fp)
+            if limited:
+                msg = reason
             else:
-                with engine.begin() as conn:
-                    conn.execute(
-                        text(
-                            "INSERT INTO ratings (driver_id, score, ip, comment) "
-                            "VALUES (:driver_id, :score, :ip, :comment)"
-                        ),
-                        {
-                            "driver_id": driver_id,
-                            "score": score,
-                            "ip": ip,
-                            "comment": comment,
-                        },
-                    )
-                body = f"""
-                <h1>Obrigado pela sua avaliação 💙</h1>
-                <p class="subtitle-center">
-                    Sua opinião ajuda a melhorar a qualidade das entregas.
-                </p>
-                <p style="text-align:center; margin-top:1rem;">
-                    Motorista avaliado: <strong>{driver['name']}</strong>
-                </p>
-                """
-                return render_page("Obrigado", body)
+                # Bloqueio por motorista + fingerprint (anti-inflar)
+                with engine.connect() as conn:
+                    cur = conn.execute(text("""
+                        SELECT COUNT(*) AS total
+                        FROM ratings
+                        WHERE driver_id = :driver_id
+                          AND fingerprint = :fp
+                          AND created_at >= NOW() - INTERVAL :days
+                    """), {"driver_id": driver_id, "fp": fp, "days": f"{DRIVER_FP_BLOCK_DAYS} days"})
+                    row = cur.mappings().first()
+                if row and (row["total"] or 0) > 0:
+                    msg = "Você já avaliou este motorista recentemente neste dispositivo."
+                else:
+                    # Bloqueio semanal (melhorado): IP OU fingerprint
+                    with engine.connect() as conn:
+                        cur = conn.execute(text("""
+                            SELECT COUNT(*) AS total
+                            FROM ratings
+                            WHERE (ip = :ip OR fingerprint = :fp)
+                              AND created_at >= NOW() - INTERVAL :days
+                        """), {"ip": ip, "fp": fp, "days": f"{WEEKLY_BLOCK_DAYS} days"})
+                        row = cur.mappings().first()
+
+                    total = row["total"] if row else 0
+                    if total > 0:
+                        msg = "Você já fez uma avaliação recentemente. Só é permitido 1 avaliação por semana neste dispositivo."
+                    else:
+                        try:
+                            score = int(request.form.get("score", "0"))
+                        except ValueError:
+                            score = 0
+
+                        comment = request.form.get("comment", "").strip()
+
+                        if score < 1 or score > 5:
+                            msg = "Selecione uma nota entre 1 e 5 estrelas."
+                        else:
+                            with engine.begin() as conn:
+                                conn.execute(
+                                    text(
+                                        "INSERT INTO ratings (driver_id, score, ip, fingerprint, comment) "
+                                        "VALUES (:driver_id, :score, :ip, :fingerprint, :comment)"
+                                    ),
+                                    {
+                                        "driver_id": driver_id,
+                                        "score": score,
+                                        "ip": ip,
+                                        "fingerprint": fp,
+                                        "comment": comment,
+                                    },
+                                )
+                            body = f"""
+                            <h1>Obrigado pela sua avaliação 💙</h1>
+                            <p class="subtitle-center">
+                                Sua opinião ajuda a melhorar a qualidade das entregas.
+                            </p>
+                            <p style="text-align:center; margin-top:1rem;">
+                                Motorista avaliado: <strong>{driver['name']}</strong>
+                            </p>
+                            """
+                            return render_page("Obrigado", body)
 
     msg_html = f'<div class="erro">{msg}</div>' if msg else ""
     body = f"""
@@ -1143,6 +1222,9 @@ def rate_driver(driver_id):
     </p>
     {msg_html}
     <form method="post">
+        <!-- Honeypot anti-bot (invisível) -->
+        <input type="text" name="website" style="display:none" tabindex="-1" autocomplete="off">
+
         <div class="rating-container">
             <div class="rating-label">Toque nas estrelas para escolher a nota:</div>
             <div class="stars">
@@ -1183,4 +1265,3 @@ def logout():
 if __name__ == "__main__":
     init_db()
     app.run(debug=True)
-
