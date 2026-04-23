@@ -1,7 +1,9 @@
 import os
 import uuid
 import hashlib
+from datetime import datetime
 from functools import wraps
+from html import escape
 from flask import Flask, request, redirect, url_for, session, make_response
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy import create_engine, text
@@ -41,7 +43,7 @@ def init_db():
                 id SERIAL PRIMARY KEY,
                 username TEXT UNIQUE NOT NULL,
                 name TEXT NOT NULL,
-                role TEXT NOT NULL,       -- 'admin' ou 'driver'
+                role TEXT NOT NULL,       -- 'admin', 'cashier' ou 'driver'
                 password_hash TEXT NOT NULL
             );
         """))
@@ -238,6 +240,7 @@ def render_page(title: str, body_html: str) -> str:
 
         input[type=text],
         input[type=password],
+        select,
         textarea {{
             padding: 10px 12px;
             border-radius: 10px;
@@ -246,6 +249,7 @@ def render_page(title: str, body_html: str) -> str:
             outline: none;
             transition: all 0.2s ease;
             font-family: inherit;
+            background:#fff;
         }}
 
         textarea {{
@@ -255,6 +259,7 @@ def render_page(title: str, body_html: str) -> str:
 
         input[type=text]:focus,
         input[type=password]:focus,
+        select:focus,
         textarea:focus {{
             border-color: var(--turq-main);
             box-shadow: 0 0 0 2px rgba(0, 188, 212, 0.25);
@@ -315,6 +320,15 @@ def render_page(title: str, body_html: str) -> str:
         }}
 
         /* Mensagens */
+        .msg {{
+            padding:10px 12px;
+            background:#e3f2fd;
+            border:1px solid #90caf9;
+            border-radius:10px;
+            margin-bottom:10px;
+            font-size:0.9rem;
+        }}
+
         .erro {{
             padding:10px 12px;
             background:#ffebee;
@@ -572,6 +586,32 @@ def render_page(title: str, body_html: str) -> str:
             white-space:pre-wrap;
         }}
 
+        .stats-grid {{
+            display:grid;
+            grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));
+            gap:12px;
+            margin-bottom:16px;
+        }}
+
+        .stat-card {{
+            padding:14px 16px;
+            border-radius:14px;
+            background:linear-gradient(180deg, rgba(77,225,255,0.18), rgba(255,255,255,0.96));
+            border:1px solid rgba(0,188,212,0.18);
+        }}
+
+        .stat-label {{
+            color:var(--text-muted);
+            font-size:0.82rem;
+            margin-bottom:4px;
+        }}
+
+        .stat-value {{
+            font-size:1.55rem;
+            font-weight:700;
+            color:var(--text-main);
+        }}
+
         @media (max-width: 480px) {{
             h1 {{
                 font-size:1.3rem;
@@ -686,6 +726,21 @@ def current_user():
     return None
 
 
+def format_rating_date(value):
+    if value is None:
+        return "-"
+    if hasattr(value, "strftime"):
+        return value.strftime("%d/%m/%Y %H:%M")
+    try:
+        return datetime.fromisoformat(str(value)).strftime("%d/%m/%Y %H:%M")
+    except ValueError:
+        return str(value)
+
+
+def esc(value):
+    return escape(str(value), quote=True)
+
+
 def login_required(role=None):
     def decorator(fn):
         @wraps(fn)
@@ -716,10 +771,17 @@ def ensure_db():
 def index():
     user = current_user()
     if user:
-        role_texto = "Administrador" if user["role"] == "admin" else "Motorista"
+        role_map = {
+            "admin": "Administrador",
+            "cashier": "Caixa",
+            "driver": "Motorista",
+        }
+        role_texto = role_map.get(user["role"], "Usuario")
         botoes = ""
         if user["role"] == "admin":
             botoes += '<p><button class="btn-full" onclick="window.location.href=\'/admin/dashboard\'">Painel do Administrador</button></p>'
+        elif user["role"] == "cashier":
+            botoes += '<p><button class="btn-full" onclick="window.location.href=\'/cashier/dashboard\'">Painel da Caixa</button></p>'
         else:
             botoes += '<p><button class="btn-full" onclick="window.location.href=\'/driver/painel\'">Painel do Motorista</button></p>'
         botoes += '<p><button class="btn-full btn-outline" onclick="window.location.href=\'/logout\'">Sair</button></p>'
@@ -741,6 +803,9 @@ def index():
         </p>
         <div class="section">
             <button class="btn-full" onclick="window.location.href='/admin/login'">Sou Administrador</button>
+        </div>
+        <div class="section">
+            <button class="btn-full btn-outline" onclick="window.location.href='/cashier/login'">Sou Caixa</button>
         </div>
         <div class="section">
             <button class="btn-full btn-outline" onclick="window.location.href='/driver/login'">Sou Motorista</button>
@@ -798,6 +863,8 @@ def admin_login():
 @app.route("/admin/dashboard")
 @login_required(role="admin")
 def admin_dashboard():
+    flash_msg = request.args.get("msg", "").strip()
+    flash_error = request.args.get("error", "").strip()
     with engine.connect() as conn:
         drivers = conn.execute(text("""
             SELECT
@@ -941,6 +1008,14 @@ def admin_dashboard():
     <p class="subtitle-center">
         Veja notas, acompanhe comentários e gerencie motoristas.
     </p>
+    {'<div class="msg">' + esc(flash_msg) + '</div>' if flash_msg else ''}
+    {'<div class="erro">' + esc(flash_error) + '</div>' if flash_error else ''}
+
+    <div class="section">
+        <div class="section-title">Equipe da caixa</div>
+        <div class="section-subtitle">Cadastre e gerencie os acessos da caixa em uma Ã¡rea separada.</div>
+        <button class="btn-full btn-outline" type="button" onclick="window.location.href='/admin/cashiers'">Gerenciar caixas</button>
+    </div>
 
     <div class="section">
         <div class="section-title">Cadastrar novo motorista</div>
@@ -1032,6 +1107,120 @@ def create_driver():
     return redirect(url_for("admin_dashboard"))
 
 
+@app.route("/admin/cashiers")
+@login_required(role="admin")
+def admin_cashiers():
+    flash_msg = request.args.get("msg", "").strip()
+    flash_error = request.args.get("error", "").strip()
+    with engine.connect() as conn:
+        cashiers = conn.execute(text("""
+            SELECT id, name, username
+            FROM users
+            WHERE role = 'cashier'
+            ORDER BY name;
+        """)).mappings().all()
+
+    rows = ""
+    for cashier in cashiers:
+        rows += f"""
+        <tr>
+            <td>{esc(cashier['name'])}</td>
+            <td>{esc(cashier['username'])}</td>
+            <td>
+                <div class="table-actions">
+                    <form method="post" action="/admin/delete_cashier/{cashier['id']}">
+                        <button class="btn-danger btn-sm"
+                            onclick="return confirm('Excluir este caixa?');">
+                            Excluir
+                        </button>
+                    </form>
+                </div>
+            </td>
+        </tr>
+        """
+
+    body = f"""
+    <h1>Gestao de Caixas</h1>
+    <p class="subtitle-center">O administrador cria os acessos da equipe do caixa.</p>
+    {'<div class="msg">' + esc(flash_msg) + '</div>' if flash_msg else ''}
+    {'<div class="erro">' + esc(flash_error) + '</div>' if flash_error else ''}
+
+    <div class="section">
+        <div class="section-title">Cadastrar novo caixa</div>
+        <div class="section-subtitle">Esse acesso entra somente na tela de impressao.</div>
+        <form method="post" action="/admin/create_cashier">
+            <label>Nome do caixa</label>
+            <input type="text" name="name" required>
+            <label>Usuario para login do caixa</label>
+            <input type="text" name="username" required>
+            <label>Senha para login do caixa</label>
+            <input type="password" name="password" required>
+            <button type="submit">Cadastrar Caixa</button>
+        </form>
+    </div>
+
+    <div class="section">
+        <div class="section-title">Caixas cadastrados</div>
+        <div class="section-subtitle">Esses usuarios acessam apenas a area da caixa para impressao.</div>
+        <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Nome</th>
+                        <th>Usuario</th>
+                        <th>Acoes</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="section">
+        <button class="btn-full btn-outline" type="button" onclick="window.location.href='/admin/dashboard'">Voltar para o admin</button>
+    </div>
+    """
+
+    resp = make_response(render_page("Gestao de Caixas", body))
+    ensure_device_cookie(resp)
+    return resp
+
+
+@app.route("/admin/create_cashier", methods=["POST"])
+@login_required(role="admin")
+def create_cashier():
+    name = request.form.get("name", "").strip()
+    username = request.form.get("username", "").strip()
+    password = request.form.get("password", "")
+    if not name or not username or not password:
+        return "Dados invÃ¡lidos", 400
+
+    try:
+        password_hash = generate_password_hash(password)
+        with engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO users (username, name, role, password_hash) "
+                    "VALUES (:username, :name, 'cashier', :password_hash)"
+                ),
+                {"username": username, "name": name, "password_hash": password_hash},
+            )
+    except IntegrityError:
+        return redirect(url_for("admin_cashiers", error="UsuÃ¡rio jÃ¡ existe"))
+
+    return redirect(url_for("admin_cashiers", msg="Caixa cadastrado com sucesso"))
+
+
+@app.route("/admin/delete_cashier/<int:cashier_id>", methods=["POST"])
+@login_required(role="admin")
+def delete_cashier(cashier_id):
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM users WHERE id = :id AND role = 'cashier'"), {"id": cashier_id})
+    return redirect(url_for("admin_cashiers", msg="Caixa removido com sucesso"))
+
+
 @app.route("/admin/reset_ratings/<int:driver_id>", methods=["POST"])
 @login_required(role="admin")
 def reset_ratings(driver_id):
@@ -1053,8 +1242,250 @@ def reset_all_ratings():
 def delete_driver(driver_id):
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM ratings WHERE driver_id = :id"), {"id": driver_id})
-        conn.execute(text("DELETE FROM users WHERE id = :id"), {"id": driver_id})
+        conn.execute(text("DELETE FROM users WHERE id = :id AND role = 'driver'"), {"id": driver_id})
     return redirect(url_for("admin_dashboard"))
+
+
+# ----- LOGIN CAIXA -----
+
+@app.route("/cashier/login", methods=["GET", "POST"])
+def cashier_login():
+    msg = ""
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        with engine.connect() as conn:
+            cur = conn.execute(
+                text("SELECT id, username, name, role, password_hash FROM users WHERE username = :u AND role = 'cashier'"),
+                {"u": username},
+            )
+            user = cur.mappings().first()
+        if user and check_password_hash(user["password_hash"], password):
+            session["user_id"] = user["id"]
+            return redirect(url_for("cashier_dashboard"))
+        msg = "UsuÃ¡rio ou senha invÃ¡lidos."
+
+    msg_html = f'<div class="erro">{msg}</div>' if msg else ""
+    body = f"""
+    <h1>Login da Caixa</h1>
+    <p class="subtitle-center">
+        Entre para escolher o motorista cadastrado e imprimir a etiqueta de avaliaÃ§Ã£o.
+    </p>
+    {msg_html}
+    <form method="post" class="section">
+        <label>UsuÃ¡rio</label>
+        <input type="text" name="username">
+        <label>Senha</label>
+        <input type="password" name="password">
+        <button type="submit" class="btn-full">Entrar</button>
+    </form>
+    <div class="section">
+        <button class="btn-full btn-outline" type="button" onclick="window.location.href='/'">Voltar</button>
+    </div>
+    """
+
+    resp = make_response(render_page("Login Caixa", body))
+    ensure_device_cookie(resp)
+    return resp
+
+
+@app.route("/cashier/dashboard")
+@login_required(role="cashier")
+def cashier_dashboard():
+    user = current_user()
+    flash_msg = request.args.get("msg", "").strip()
+    flash_error = request.args.get("error", "").strip()
+    with engine.connect() as conn:
+        drivers = conn.execute(text("""
+            SELECT id, name, username
+            FROM users
+            WHERE role = 'driver'
+            ORDER BY name;
+        """)).mappings().all()
+
+    options_html = "".join(
+        f'<option value="{driver["id"]}">{esc(driver["name"])} ({esc(driver["username"])})</option>'
+        for driver in drivers
+    )
+
+    body = f"""
+    <h1>Painel da Caixa</h1>
+    <p class="subtitle-center">
+        Login ativo: <strong>{esc(user['name'])}</strong>. Escolha o motorista cadastrado e gere a etiqueta.
+    </p>
+    {'<div class="msg">' + esc(flash_msg) + '</div>' if flash_msg else ''}
+    {'<div class="erro">' + esc(flash_error) + '</div>' if flash_error else ''}
+
+    <div class="section">
+        <div class="section-title">Imprimir etiqueta</div>
+        <div class="section-subtitle">A caixa entra apenas para escolher o motorista e imprimir.</div>
+        <form method="get" action="/cashier/print_label" target="_blank">
+            <label>Motorista cadastrado</label>
+            <select name="driver_id" required>
+                <option value="">Selecione um motorista</option>
+                {options_html}
+            </select>
+            <button type="submit" class="btn-full">Gerar etiqueta com QR Code</button>
+        </form>
+    </div>
+
+    <div class="section">
+        <button class="btn-full btn-outline" type="button" onclick="window.location.href='/logout'">Sair</button>
+    </div>
+    """
+
+    resp = make_response(render_page("Painel da Caixa", body))
+    ensure_device_cookie(resp)
+    return resp
+
+
+@app.route("/cashier/print_label")
+@login_required(role="cashier")
+def print_label():
+    try:
+        driver_id = int(request.args.get("driver_id", "0"))
+    except ValueError:
+        driver_id = 0
+
+    if driver_id <= 0:
+        return redirect(url_for("cashier_dashboard", error="Selecione um motorista cadastrado para imprimir a etiqueta."))
+
+    with engine.connect() as conn:
+        driver = conn.execute(
+            text("SELECT id, name, username FROM users WHERE id = :id AND role = 'driver'"),
+            {"id": driver_id},
+        ).mappings().first()
+
+    if not driver:
+        return redirect(url_for("cashier_dashboard", error="Motorista nÃ£o encontrado. Confira a lista cadastrada."))
+
+    rate_url = request.url_root.rstrip("/") + url_for("rate_driver", driver_id=driver["id"])
+    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=320x320&data={rate_url}"
+
+    body = f"""
+    <style>
+        .label-shell {{
+            display:flex;
+            flex-direction:column;
+            align-items:center;
+            gap:16px;
+        }}
+
+        .label-card {{
+            width:100%;
+            max-width:420px;
+            padding:18px;
+            text-align:center;
+            border-radius:18px;
+            background:#fff;
+            border:2px dashed rgba(2,48,71,0.18);
+            box-shadow:0 14px 34px rgba(0,0,0,0.10);
+        }}
+
+        .label-eyebrow {{
+            margin-bottom:8px;
+            color:#008ba3;
+            font-size:0.78rem;
+            font-weight:800;
+            letter-spacing:0.08em;
+            text-transform:uppercase;
+        }}
+
+        .label-title {{
+            margin-bottom:8px;
+            font-size:1.35rem;
+            font-weight:800;
+            line-height:1.2;
+        }}
+
+        .label-driver {{
+            margin-bottom:14px;
+            font-size:1rem;
+        }}
+
+        .label-qr img {{
+            width:220px;
+            height:220px;
+            object-fit:contain;
+        }}
+
+        .label-footer {{
+            margin-top:12px;
+            color:#526674;
+            font-size:0.92rem;
+        }}
+
+        .label-actions {{
+            display:flex;
+            gap:10px;
+            width:100%;
+            max-width:420px;
+        }}
+
+        .label-actions button {{
+            flex:1;
+        }}
+
+        @media print {{
+            .topbar,
+            .label-actions {{
+                display:none !important;
+            }}
+
+            .page {{
+                padding:0 !important;
+                min-height:auto !important;
+            }}
+
+            .card {{
+                max-width:none !important;
+                padding:0 !important;
+                border-radius:0 !important;
+                box-shadow:none !important;
+            }}
+
+            .label-card {{
+                width:90mm;
+                min-height:60mm;
+                margin:0 auto;
+                border:1px solid #d6dde2;
+                box-shadow:none;
+                page-break-inside:avoid;
+            }}
+        }}
+    </style>
+
+    <div class="label-shell">
+        <div class="label-card">
+            <div class="label-eyebrow">Etiqueta de avaliaÃ§Ã£o</div>
+            <div class="label-title">Avalie nosso entregador e nossa entrega</div>
+            <div class="label-driver">Motorista: <strong>{esc(driver['name'])}</strong></div>
+            <div class="label-qr">
+                <img src="{qr_url}" alt="QR Code para avaliar a entrega">
+            </div>
+            <div class="label-footer">
+                Aponte a cÃ¢mera do celular para o QR Code e deixe sua nota.
+            </div>
+        </div>
+
+        <div class="label-actions">
+            <button type="button" onclick="window.print()">Imprimir novamente</button>
+            <button type="button" class="btn-outline" onclick="window.close()">Fechar</button>
+        </div>
+    </div>
+
+    <script>
+        window.addEventListener("load", function() {{
+            setTimeout(function() {{
+                window.print();
+            }}, 250);
+        }});
+    </script>
+    """
+
+    resp = make_response(render_page("Imprimir Etiqueta", body))
+    ensure_device_cookie(resp)
+    return resp
 
 
 # ----- LOGIN MOTORISTA -----
@@ -1080,7 +1511,7 @@ def driver_login():
     body = f"""
     <h1>Login do Motorista 🛵</h1>
     <p class="subtitle-center">
-        Entre para gerar seu QR Code e compartilhar com os clientes.
+        Entre para acompanhar apenas suas avaliaÃ§Ãµes e os comentÃ¡rios dos clientes.
     </p>
     {msg_html}
     <form method="post" class="section">
@@ -1106,25 +1537,64 @@ def driver_login():
 @login_required(role="driver")
 def driver_panel():
     user = current_user()
-    rate_url = request.url_root.rstrip("/") + url_for("rate_driver", driver_id=user["id"])
-    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=260x260&data={rate_url}"
+    with engine.connect() as conn:
+        summary = conn.execute(text("""
+            SELECT
+                COUNT(*) AS total_avaliacoes,
+                COALESCE(ROUND(AVG(score)::numeric, 2), 0) AS media
+            FROM ratings
+            WHERE driver_id = :id
+        """), {"id": user["id"]}).mappings().first()
+
+        ratings = conn.execute(text("""
+            SELECT score, comment, created_at
+            FROM ratings
+            WHERE driver_id = :id
+            ORDER BY created_at DESC, id DESC
+        """), {"id": user["id"]}).mappings().all()
+
+    reviews_html = ""
+    for rating in ratings:
+        comment = (rating["comment"] or "").strip()
+        comment_html = (
+            f'<div class="comment-text">{esc(comment)}</div>'
+            if comment
+            else '<div class="comment-text" style="font-style:italic;color:#78909c;">Cliente nÃ£o deixou comentÃ¡rio nesta avaliaÃ§Ã£o.</div>'
+        )
+        reviews_html += f"""
+        <div class="comment-item">
+            <div class="comment-header">
+                <span class="comment-driver">Nota: {rating['score']}/5</span>
+                <span class="comment-date">{esc(format_rating_date(rating['created_at']))}</span>
+            </div>
+            {comment_html}
+        </div>
+        """
+
+    if not reviews_html:
+        reviews_html = "<div class='comment-text'>Ainda nÃ£o hÃ¡ avaliaÃ§Ãµes registradas para este motorista.</div>"
 
     body = f"""
     <h1>Painel do Motorista 🚚</h1>
     <p class="subtitle-center">
-        Mostre o QR Code abaixo para o cliente avaliar atendimento e tempo de entrega.
+        Aqui vocÃª acompanha somente suas avaliaÃ§Ãµes e os comentÃ¡rios recebidos dos clientes.
     </p>
-    <div style="text-align:center; margin: 10px 0 6px;">
-        <img src="{qr_url}" alt="QR Code" style="border-radius:16px; box-shadow:0 10px 30px rgba(0,0,0,0.20); max-width:80vw;">
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-label">Sua mÃ©dia atual</div>
+            <div class="stat-value">{summary['media']}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Total de avaliaÃ§Ãµes</div>
+            <div class="stat-value">{summary['total_avaliacoes']}</div>
+        </div>
     </div>
-    <p class="subtitle-center" style="font-size:0.85rem;">
-        Ou compartilhe o link direto:
-    </p>
-    <p style="text-align:center; margin-bottom:1rem;">
-        <code>{rate_url}</code>
-    </p>
     <div class="section">
-        <button class="btn-full btn-outline" type="button" onclick="window.location.href='/'">Voltar</button>
+        <div class="section-title">AvaliaÃ§Ãµes e comentÃ¡rios recebidos</div>
+        <div class="section-subtitle">Cada item mostra a nota individual e o comentÃ¡rio deixado pelo cliente.</div>
+        <div class="comment-list">
+            {reviews_html}
+        </div>
     </div>
     <div class="section">
         <button class="btn-full btn-outline" type="button" onclick="window.location.href='/logout'">Sair</button>
