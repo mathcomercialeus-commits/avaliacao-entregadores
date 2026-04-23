@@ -4,6 +4,7 @@ import hashlib
 from datetime import datetime
 from functools import wraps
 from html import escape
+from urllib.parse import quote
 from flask import Flask, request, redirect, url_for, session, make_response
 from werkzeug.security import generate_password_hash, check_password_hash
 from sqlalchemy import create_engine, text
@@ -30,6 +31,7 @@ DRIVER_DEVICE_BLOCK_DAYS = 30    # 1 avaliação por motorista por dispositivo e
 
 # Se estiver em HTTPS e quiser forçar cookie Secure, setar env COOKIE_SECURE=1 no Render
 COOKIE_SECURE_ENV = os.getenv("COOKIE_SECURE", "0") == "1"
+LABEL_TOKEN_EXPIRY_HOURS = 48
 
 
 # ---------------- BANCO DE DADOS (POSTGRES) ----------------
@@ -63,6 +65,20 @@ def init_db():
             );
         """))
 
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS rating_tokens (
+                id SERIAL PRIMARY KEY,
+                token TEXT UNIQUE NOT NULL,
+                driver_id INTEGER NOT NULL,
+                cashier_id INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at TIMESTAMP NOT NULL,
+                used_at TIMESTAMP,
+                FOREIGN KEY (driver_id) REFERENCES users(id),
+                FOREIGN KEY (cashier_id) REFERENCES users(id)
+            );
+        """))
+
         # Garantir colunas (seguro em PostgreSQL)
         conn.execute(text("ALTER TABLE ratings ADD COLUMN IF NOT EXISTS comment TEXT;"))
         conn.execute(text("ALTER TABLE ratings ADD COLUMN IF NOT EXISTS fingerprint TEXT;"))
@@ -73,6 +89,8 @@ def init_db():
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ratings_fp_created ON ratings (fingerprint, created_at);"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ratings_device_created ON ratings (device_id, created_at);"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ratings_driver_device_created ON ratings (driver_id, device_id, created_at);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_rating_tokens_driver_created ON rating_tokens (driver_id, created_at);"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_rating_tokens_expires_used ON rating_tokens (expires_at, used_at);"))
 
         # Cria admin padrão FARMALIMA se não existir
         cur = conn.execute(
@@ -798,7 +816,7 @@ def index():
         body = """
         <h1>🚚 Avaliação de Entregas</h1>
         <p class="subtitle-center">
-            Motoristas mostram o QR Code.<br>
+            A caixa imprime um QR Code Ãºnico para cada entrega.<br>
             Clientes avaliam o atendimento e o tempo de entrega em poucos toques.
         </p>
         <div class="section">
@@ -893,8 +911,6 @@ def admin_dashboard():
             LIMIT 30;
         """)).mappings().all()
 
-    base_url = request.url_root.rstrip("/")
-
     linhas = ""
     for d in drivers:
         total = d["total_avaliacoes"] or 0
@@ -913,8 +929,6 @@ def admin_dashboard():
         p3 = perc(s3)
         p2 = perc(s2)
         p1 = perc(s1)
-
-        link_avaliacao = f"{base_url}{url_for('rate_driver', driver_id=d['id'])}"
 
         rating_html = f"""
         <div class="rating-summary">
@@ -967,7 +981,7 @@ def admin_dashboard():
         <tr>
             <td>{d['name']}</td>
             <td>{rating_html}</td>
-            <td><code>{link_avaliacao}</code></td>
+            <td><span class="comment-date">QR Ãºnico gerado pela caixa</span></td>
             <td>
                 <div class="table-actions">
                     <form method="post" action="/admin/reset_ratings/{d['id']}">
@@ -1019,7 +1033,7 @@ def admin_dashboard():
 
     <div class="section">
         <div class="section-title">Cadastrar novo motorista</div>
-        <div class="section-subtitle">Crie o login que o entregador vai usar para gerar o QR Code.</div>
+        <div class="section-subtitle">Crie o login que o entregador vai usar para acompanhar as notas e comentÃ¡rios dele.</div>
         <form method="post" action="/admin/create_driver">
             <label>Nome do motorista</label>
             <input type="text" name="name" required>
@@ -1318,7 +1332,7 @@ def cashier_dashboard():
 
     <div class="section">
         <div class="section-title">Imprimir etiqueta</div>
-        <div class="section-subtitle">A caixa entra apenas para escolher o motorista e imprimir.</div>
+        <div class="section-subtitle">Cada impressÃ£o gera um QR Code Ãºnico, vÃ¡lido para uma avaliaÃ§Ã£o.</div>
         <form method="get" action="/cashier/print_label" target="_blank">
             <label>Motorista cadastrado</label>
             <select name="driver_id" required>
@@ -1342,6 +1356,7 @@ def cashier_dashboard():
 @app.route("/cashier/print_label")
 @login_required(role="cashier")
 def print_label():
+    cashier = current_user()
     try:
         driver_id = int(request.args.get("driver_id", "0"))
     except ValueError:
@@ -1356,11 +1371,36 @@ def print_label():
             {"id": driver_id},
         ).mappings().first()
 
+    if False:
+        body = """
+        <h1>QR Code invÃ¡lido</h1>
+        <p class="subtitle-center">
+            Esta etiqueta nÃ£o foi encontrada. Solicite uma nova impressÃ£o no caixa.
+        </p>
+        """
+        resp = make_response(render_page("QR invÃ¡lido", body))
+        ensure_device_cookie(resp)
+        return resp, 404
+
     if not driver:
         return redirect(url_for("cashier_dashboard", error="Motorista nÃ£o encontrado. Confira a lista cadastrada."))
 
-    rate_url = request.url_root.rstrip("/") + url_for("rate_driver", driver_id=driver["id"])
-    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=320x320&data={rate_url}"
+    label_token = uuid.uuid4().hex
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO rating_tokens (token, driver_id, cashier_id, expires_at) "
+                f"VALUES (:token, :driver_id, :cashier_id, NOW() + INTERVAL '{LABEL_TOKEN_EXPIRY_HOURS} hours')"
+            ),
+            {
+                "token": label_token,
+                "driver_id": driver["id"],
+                "cashier_id": cashier["id"] if cashier else None,
+            },
+        )
+
+    rate_url = request.url_root.rstrip("/") + url_for("rate_token", token=label_token)
+    qr_url = f"https://api.qrserver.com/v1/create-qr-code/?size=320x320&data={quote(rate_url, safe='')}"
 
     body = f"""
     <style>
@@ -1608,17 +1648,54 @@ def driver_panel():
 
 # ----- PÁGINA DE AVALIAÇÃO (COM COMENTÁRIO + ANTIFRAUDE) -----
 
-@app.route("/avaliar/<int:driver_id>", methods=["GET", "POST"])
-def rate_driver(driver_id):
+@app.route("/avaliar/token/<token>", methods=["GET", "POST"])
+def rate_token(token):
     with engine.connect() as conn:
-        cur = conn.execute(
-            text("SELECT id, username, name, role FROM users WHERE id = :id AND role = 'driver'"),
-            {"id": driver_id},
-        )
-        driver = cur.mappings().first()
+        token_row = conn.execute(
+            text("""
+                SELECT
+                    rt.id,
+                    rt.driver_id,
+                    CASE WHEN rt.used_at IS NOT NULL THEN TRUE ELSE FALSE END AS is_used,
+                    CASE WHEN rt.expires_at < NOW() THEN TRUE ELSE FALSE END AS is_expired,
+                    u.name AS driver_name
+                FROM rating_tokens rt
+                JOIN users u ON u.id = rt.driver_id AND u.role = 'driver'
+                WHERE rt.token = :token
+            """),
+            {"token": token},
+        ).mappings().first()
+
+    driver = None
+    if token_row:
+        driver = {"id": token_row["driver_id"], "name": token_row["driver_name"]}
 
     if not driver:
         return "Motorista não encontrado", 404
+
+    if token_row["is_used"]:
+        body = f"""
+        <h1>QR Code jÃ¡ utilizado</h1>
+        <p class="subtitle-center">
+            A etiqueta do motorista <strong>{esc(token_row['driver_name'])}</strong> jÃ¡ foi usada em uma avaliaÃ§Ã£o.
+        </p>
+        <p style="text-align:center;">Se precisar, peÃ§a uma nova etiqueta no caixa.</p>
+        """
+        resp = make_response(render_page("QR jÃ¡ utilizado", body))
+        ensure_device_cookie(resp)
+        return resp, 410
+
+    if token_row["is_expired"]:
+        body = f"""
+        <h1>QR Code expirado</h1>
+        <p class="subtitle-center">
+            A etiqueta do motorista <strong>{esc(token_row['driver_name'])}</strong> venceu e nÃ£o pode mais receber avaliaÃ§Ãµes.
+        </p>
+        <p style="text-align:center;">Solicite uma nova etiqueta no caixa.</p>
+        """
+        resp = make_response(render_page("QR expirado", body))
+        ensure_device_cookie(resp)
+        return resp, 410
 
     ip = get_client_ip()
     fp = device_fingerprint()
@@ -1660,7 +1737,7 @@ def rate_driver(driver_id):
                         WHERE driver_id = :driver_id
                           AND device_id = :did
                           AND created_at >= NOW() - INTERVAL '{DRIVER_DEVICE_BLOCK_DAYS} days'
-                    """), {"driver_id": driver_id, "did": did}).mappings().first()
+                    """), {"driver_id": driver["id"], "did": did}).mappings().first()
 
                 if r_driver and (r_driver["total"] or 0) > 0:
                     msg = "Você já avaliou este motorista recentemente neste dispositivo."
@@ -1694,13 +1771,17 @@ def rate_driver(driver_id):
                                         "VALUES (:driver_id, :score, :ip, :fingerprint, :device_id, :comment)"
                                     ),
                                     {
-                                        "driver_id": driver_id,
+                                        "driver_id": driver["id"],
                                         "score": score,
                                         "ip": ip,
                                         "fingerprint": fp,
                                         "device_id": did,
                                         "comment": comment,
                                     },
+                                )
+                                conn.execute(
+                                    text("UPDATE rating_tokens SET used_at = NOW() WHERE id = :id AND used_at IS NULL"),
+                                    {"id": token_row["id"]},
                                 )
 
                             body = f"""
@@ -1709,7 +1790,7 @@ def rate_driver(driver_id):
                                 Sua opinião ajuda a melhorar a qualidade das entregas.
                             </p>
                             <p style="text-align:center; margin-top:1rem;">
-                                Motorista avaliado: <strong>{driver['name']}</strong>
+                                Motorista avaliado: <strong>{esc(driver['name'])}</strong>
                             </p>
                             """
                             resp = make_response(render_page("Obrigado", body))
@@ -1720,7 +1801,7 @@ def rate_driver(driver_id):
     body = f"""
     <h1>Avalie sua entrega ⭐</h1>
     <p class="subtitle-center">
-        Motorista: <strong>{driver['name']}</strong><br>
+        Motorista: <strong>{esc(driver['name'])}</strong><br>
         Como você avalia <strong>atendimento</strong> e <strong>tempo de entrega</strong>?
     </p>
     {msg_html}
@@ -1756,6 +1837,22 @@ def rate_driver(driver_id):
     resp = make_response(render_page("Avaliar Entregador", body))
     ensure_device_cookie(resp)
     return resp
+
+
+@app.route("/avaliar/<int:driver_id>", methods=["GET", "POST"])
+def rate_driver(driver_id):
+    body = """
+    <h1>Use a etiqueta atual</h1>
+    <p class="subtitle-center">
+        As avaliaÃ§Ãµes agora funcionam com um QR Code Ãºnico por impressÃ£o.
+    </p>
+    <p style="text-align:center;">
+        Solicite uma nova etiqueta no caixa para registrar a avaliaÃ§Ã£o.
+    </p>
+    """
+    resp = make_response(render_page("Nova etiqueta necessÃ¡ria", body))
+    ensure_device_cookie(resp)
+    return resp, 410
 
 
 # ----- LOGOUT -----
