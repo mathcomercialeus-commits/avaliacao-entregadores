@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: avaliacao-entregadores
+    env: python
+    branch: mainfrf
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
